@@ -14,6 +14,7 @@ import {
   type Driver,
   type IsolationLevel,
   type AccessMode,
+  assertTransactionSettingsSupported,
   validateTransactionSettings,
 } from './driver/driver.js'
 import {
@@ -50,6 +51,7 @@ import type {
   AbortableOperationOptions,
   AbortableQueryOptions,
 } from './util/abort.js'
+import { randomString } from './util/random-string.js'
 
 declare global {
   interface AsyncDisposable {}
@@ -644,10 +646,12 @@ export class Kysely<DB>
 
 export class Transaction<DB> extends Kysely<DB> {
   readonly #props: KyselyProps
+  readonly #state: ControlledTransctionState
 
-  constructor(props: KyselyProps) {
+  constructor(props: KyselyProps, state?: ControlledTransctionState) {
     super(props)
     this.#props = props
+    this.#state = state ?? { isCommitted: false, isRolledBack: false }
   }
 
   // The return type is `true` instead of `boolean` to make Kysely<DB>
@@ -658,21 +662,17 @@ export class Transaction<DB> extends Kysely<DB> {
   }
 
   /**
-   * @deprecated calling the transaction method for a Transaction is not supported
+   * True when this transaction has been committed.
    */
-  override transaction(): never {
-    throw new Error(
-      'calling the transaction method for a Transaction is not supported',
-    )
+  get isCommitted(): boolean {
+    return this.#state.isCommitted
   }
 
   /**
-   * @deprecated calling the controlled transaction method for a Transaction is not supported
+   * True when this transaction has been rolled back.
    */
-  override startTransaction(): never {
-    throw new Error(
-      'calling the controlled transaction method for a Transaction is not supported',
-    )
+  get isRolledBack(): boolean {
+    return this.#state.isRolledBack
   }
 
   /**
@@ -683,6 +683,38 @@ export class Transaction<DB> extends Kysely<DB> {
       'calling the connection method for a Transaction is not supported',
     )
   }
+
+  /**
+   * Opens a nested transaction.
+   *
+   * Nested transactions are implemented using savepoints: a new savepoint
+   * is established on the same connection, inner failure only rolls back to
+   * the savepoint and inner success releases it. The outer transaction is
+   * still able to roll back everything, including the inner transaction's
+   * changes.
+   */
+  override transaction(): TransactionBuilder<DB> {
+    return new NestedTransactionBuilder<DB>({
+      ...this.#props,
+      state: this.#state,
+      savepointDepth: this.#savepointDepth + 1,
+    })
+  }
+
+  /**
+   * Opens a nested controlled transaction backed by a savepoint.
+   *
+   * See {@link transaction} for how nested transactions behave.
+   */
+  override startTransaction(): ControlledTransactionBuilder<DB> {
+    return new NestedControlledTransactionBuilder<DB>({
+      ...this.#props,
+      state: this.#state,
+      savepointDepth: this.#savepointDepth + 1,
+    })
+  }
+
+  #savepointDepth = 0
 
   /**
    * @deprecated calling the destroy method for a Transaction is not supported
@@ -885,9 +917,17 @@ export class TransactionBuilder<DB> {
     const settings = { isolationLevel, accessMode }
 
     validateTransactionSettings(settings)
+    assertTransactionSettingsSupported(
+      this.#props.driver,
+      settings,
+      this.#props.dialect.constructor.name,
+    )
 
     return this.#props.executor.provideConnection(async (connection) => {
-      const state = { isCommitted: false, isRolledBack: false }
+      const state: ControlledTransctionState = {
+        isCommitted: false,
+        isRolledBack: false,
+      }
 
       const executor = new NotCommittedOrRolledBackAssertingExecutor(
         this.#props.executor.withConnectionProvider(
@@ -896,7 +936,10 @@ export class TransactionBuilder<DB> {
         state,
       )
 
-      const transaction = new Transaction<DB>({ ...kyselyProps, executor })
+      const transaction = new Transaction<DB>(
+        { ...kyselyProps, executor },
+        state,
+      )
 
       let transactionBegun = false
       try {
@@ -924,6 +967,115 @@ export class TransactionBuilder<DB> {
 interface TransactionBuilderProps extends KyselyProps {
   readonly accessMode?: AccessMode
   readonly isolationLevel?: IsolationLevel
+}
+
+interface NestedTransactionBuilderProps extends TransactionBuilderProps {
+  readonly state: ControlledTransctionState
+  readonly savepointDepth: number
+}
+
+/**
+ * A nested transaction implemented as a savepoint on the outer
+ * transaction's connection.
+ */
+class NestedTransactionBuilder<DB> extends TransactionBuilder<DB> {
+  readonly #nestedProps: NestedTransactionBuilderProps
+
+  constructor(props: NestedTransactionBuilderProps) {
+    const { state: _state, savepointDepth: _savepointDepth, ...builderProps } =
+      props
+    super(builderProps)
+    this.#nestedProps = props
+  }
+
+  override setAccessMode(accessMode: AccessMode): TransactionBuilder<DB> {
+    return new NestedTransactionBuilder({
+      ...this.#nestedProps,
+      accessMode,
+    })
+  }
+
+  override setIsolationLevel(
+    isolationLevel: IsolationLevel,
+  ): TransactionBuilder<DB> {
+    return new NestedTransactionBuilder({
+      ...this.#nestedProps,
+      isolationLevel,
+    })
+  }
+
+  override async execute<T>(
+    callback: (trx: Transaction<DB>) => Promise<T>,
+  ): Promise<T> {
+    const {
+      isolationLevel,
+      accessMode,
+      state,
+      savepointDepth,
+      ...props
+    } = this.#nestedProps
+
+    if (isolationLevel || accessMode) {
+      throw new Error(
+        'isolation level and access mode cannot be changed for a nested transaction',
+      )
+    }
+
+    const savepointName = createNestedSavepointName(savepointDepth)
+    const queryId = createQueryId()
+    const compileQuery = (node: RootOperationNode) =>
+      props.executor.compileQuery(node, queryId)
+
+    await props.driver.savepoint!(
+      await getCurrentConnection(props.executor),
+      savepointName,
+      compileQuery,
+    )
+
+    const transaction = new Transaction<DB>(
+      { ...props },
+      state,
+    )
+
+    try {
+      const result = await callback(transaction)
+
+      await props.driver.releaseSavepoint!(
+        await getCurrentConnection(props.executor),
+        savepointName,
+        compileQuery,
+      )
+
+      return result
+    } catch (error) {
+      // A failure here must surface: the caller must not believe the
+      // (outer) transaction is still healthy.
+      await props.driver.rollbackToSavepoint!(
+        await getCurrentConnection(props.executor),
+        savepointName,
+        compileQuery,
+      )
+
+      throw error
+    }
+  }
+}
+
+function createNestedSavepointName(savepointDepth: number): string {
+  // Each nesting level gets its own name so inner and outer transactions
+  // can't accidentally refer to the same savepoint. The random suffix
+  // makes the name reusable after the outer transaction has ended.
+  return `kysely_sp_${savepointDepth}_${randomString(8)}`
+}
+
+async function getCurrentConnection(
+  executor: QueryExecutor,
+): Promise<DatabaseConnection> {
+  let connection!: DatabaseConnection
+  await executor.provideConnection(async (acquired) => {
+    connection = acquired
+  })
+  return connection
 }
 
 export class ControlledTransactionBuilder<DB> {
@@ -954,6 +1106,11 @@ export class ControlledTransactionBuilder<DB> {
     const settings = { isolationLevel, accessMode }
 
     validateTransactionSettings(settings)
+    assertTransactionSettingsSupported(
+      this.#props.driver,
+      settings,
+      this.#props.dialect.constructor.name,
+    )
 
     const connection = await provideControlledConnection(this.#props.executor)
 
@@ -969,6 +1126,82 @@ export class ControlledTransactionBuilder<DB> {
   }
 }
 
+interface NestedControlledTransactionBuilderProps
+  extends TransactionBuilderProps {
+  readonly state: ControlledTransctionState
+  readonly savepointDepth: number
+}
+
+/**
+ * A nested controlled transaction. Backed by a savepoint instead of a
+ * database transaction, so it never releases the outer connection.
+ */
+class NestedControlledTransactionBuilder<DB> extends ControlledTransactionBuilder<DB> {
+  readonly #nestedProps: NestedControlledTransactionBuilderProps
+
+  constructor(props: NestedControlledTransactionBuilderProps) {
+    const {
+      state: _state,
+      savepointDepth: _savepointDepth,
+      ...builderProps
+    } = props
+    super(builderProps)
+    this.#nestedProps = props
+  }
+
+  override setAccessMode(
+    accessMode: AccessMode,
+  ): ControlledTransactionBuilder<DB> {
+    return new NestedControlledTransactionBuilder({
+      ...this.#nestedProps,
+      accessMode,
+    })
+  }
+
+  override setIsolationLevel(
+    isolationLevel: IsolationLevel,
+  ): ControlledTransactionBuilder<DB> {
+    return new NestedControlledTransactionBuilder({
+      ...this.#nestedProps,
+      isolationLevel,
+    })
+  }
+
+  override async execute(): Promise<ControlledTransaction<DB>> {
+    const {
+      isolationLevel,
+      accessMode,
+      state,
+      savepointDepth,
+      ...props
+    } = this.#nestedProps
+
+    if (isolationLevel || accessMode) {
+      throw new Error(
+        'isolation level and access mode cannot be changed for a nested transaction',
+      )
+    }
+
+    const connection = await getCurrentConnection(props.executor)
+    const savepointName = createNestedSavepointName(savepointDepth)
+    const queryId = createQueryId()
+    const compileQuery = (node: RootOperationNode) =>
+      props.executor.compileQuery(node, queryId)
+
+    await props.driver.savepoint!(connection, savepointName, compileQuery)
+
+    return new ControlledTransaction({
+      ...props,
+      connection: {
+        connection,
+        release: () => {},
+      },
+      executor: props.executor,
+      savepointName,
+    })
+  }
+}
+
 export class ControlledTransaction<
   DB,
   S extends string[] = [],
@@ -978,7 +1211,10 @@ export class ControlledTransaction<
   readonly #state: ControlledTransctionState
 
   constructor(props: ControlledTransactionProps) {
-    const state = { isCommitted: false, isRolledBack: false }
+    const state: ControlledTransctionState = {
+      isCommitted: false,
+      isRolledBack: false,
+    }
     props = {
       ...props,
       executor: new NotCommittedOrRolledBackAssertingExecutor(
@@ -987,7 +1223,7 @@ export class ControlledTransaction<
       ),
     }
     const { connection, ...transactionProps } = props
-    super(transactionProps)
+    super(transactionProps, state)
 
     this.#props = freeze(props)
     this.#state = state
@@ -1032,10 +1268,19 @@ export class ControlledTransaction<
     assertNotCommittedOrRolledBack(this.#state)
 
     return new Command(async (): Promise<void> => {
-      await this.#props.driver.commitTransaction(
-        this.#props.connection.connection,
-      )
-      this.#state.isCommitted = true
+      if (this.#props.savepointName) {
+        await this.#props.driver.releaseSavepoint?.(
+          this.#props.connection.connection,
+          this.#props.savepointName,
+          this.#compileQuery,
+        )
+      } else {
+        await this.#props.driver.commitTransaction(
+          this.#props.connection.connection,
+        )
+        this.#state.isCommitted = true
+      }
+
       this.#props.connection.release()
     })
   }
@@ -1068,10 +1313,19 @@ export class ControlledTransaction<
     assertNotCommittedOrRolledBack(this.#state)
 
     return new Command(async (): Promise<void> => {
-      await this.#props.driver.rollbackTransaction(
-        this.#props.connection.connection,
-      )
-      this.#state.isRolledBack = true
+      if (this.#props.savepointName) {
+        await this.#props.driver.rollbackToSavepoint?.(
+          this.#props.connection.connection,
+          this.#props.savepointName,
+          this.#compileQuery,
+        )
+      } else {
+        await this.#props.driver.rollbackTransaction(
+          this.#props.connection.connection,
+        )
+        this.#state.isRolledBack = true
+      }
+
       this.#props.connection.release()
     })
   }
@@ -1287,6 +1541,7 @@ interface ControlledTransctionState {
 
 interface ControlledTransactionProps extends KyselyProps {
   readonly connection: ControlledConnection
+  readonly savepointName?: string
 }
 
 export class Command<T> {

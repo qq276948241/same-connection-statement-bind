@@ -3,7 +3,11 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver, TransactionSettings } from '../../driver/driver.js'
+import type {
+  Driver,
+  TransactionCapabilities,
+  TransactionSettings,
+} from '../../driver/driver.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
@@ -28,6 +32,18 @@ export class PostgresDriver implements Driver {
 
   constructor(config: PostgresDialectConfig) {
     this.#config = freeze({ ...config })
+  }
+
+  get supportsTransactionSettings(): TransactionCapabilities {
+    return {
+      isolationLevels: [
+        'read uncommitted',
+        'read committed',
+        'repeatable read',
+        'serializable',
+      ],
+      accessModes: ['read only', 'read write'],
+    }
   }
 
   async init(options?: AbortableOperationOptions): Promise<void> {

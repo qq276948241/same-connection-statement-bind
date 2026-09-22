@@ -2,7 +2,11 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver } from '../../driver/driver.js'
+import type {
+  Driver,
+  TransactionCapabilities,
+  TransactionSettings,
+} from '../../driver/driver.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import type { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
@@ -33,12 +37,27 @@ export class PGliteDriver implements Driver {
     this.#config = freeze({ ...config })
   }
 
+  get supportsTransactionSettings(): TransactionCapabilities {
+    return {
+      isolationLevels: [
+        'read uncommitted',
+        'read committed',
+        'repeatable read',
+        'serializable',
+      ],
+      accessModes: ['read only', 'read write'],
+    }
+  }
+
   async acquireConnection(): Promise<DatabaseConnection> {
     return this.#connection!
   }
 
-  async beginTransaction(connection: PGliteConnection): Promise<void> {
-    await connection[PRIVATE_BEGIN_TRANSACTION_METHOD]()
+  async beginTransaction(
+    connection: PGliteConnection,
+    settings: TransactionSettings,
+  ): Promise<void> {
+    await connection[PRIVATE_BEGIN_TRANSACTION_METHOD](settings)
   }
 
   async commitTransaction(connection: PGliteConnection): Promise<void> {
@@ -152,7 +171,9 @@ class PGliteConnection implements DatabaseConnection {
     throw new Error('Streaming is not supported by PGlite.')
   }
 
-  async [PRIVATE_BEGIN_TRANSACTION_METHOD](): Promise<void> {
+  async [PRIVATE_BEGIN_TRANSACTION_METHOD](
+    settings: TransactionSettings,
+  ): Promise<void> {
     const {
       promise: waitForCommit,
       reject: rollback,
@@ -174,6 +195,22 @@ class PGliteConnection implements DatabaseConnection {
     })
 
     await waitForBegin
+
+    const characteristics: string[] = []
+
+    if (settings.isolationLevel) {
+      characteristics.push(`isolation level ${settings.isolationLevel}`)
+    }
+
+    if (settings.accessMode) {
+      characteristics.push(settings.accessMode)
+    }
+
+    if (characteristics.length > 0) {
+      await this.#transaction!.query(
+        `set transaction ${characteristics.join(', ')}`,
+      )
+    }
   }
 
   async [PRIVATE_COMMIT_TRANSACTION_METHOD](): Promise<void> {

@@ -5,6 +5,7 @@ import type {
 import type {
   Driver,
   IsolationLevel,
+  TransactionCapabilities,
   TransactionSettings,
 } from '../../driver/driver.js'
 import {
@@ -65,6 +66,21 @@ export class MssqlDriver implements Driver {
 
   async init(): Promise<void> {
     // noop
+  }
+
+  get supportsTransactionSettings(): TransactionCapabilities {
+    return {
+      isolationLevels: [
+        'read uncommitted',
+        'read committed',
+        'repeatable read',
+        'serializable',
+        'snapshot',
+      ],
+      // SQL Server doesn't support setting the transaction access mode
+      // through the tedious driver's beginTransaction call.
+      accessModes: [],
+    }
   }
 
   async acquireConnection(): Promise<DatabaseConnection> {

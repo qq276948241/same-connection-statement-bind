@@ -384,10 +384,10 @@ async function testReadonlyTransaction(
   expectNotDeprecated(rtx.selectNoFrom)
 
   expectType<typeof tx.startTransaction>(rtx.startTransaction)
-  expectDeprecated(rtx.startTransaction)
+  expectNotDeprecated(rtx.startTransaction)
 
   expectType<typeof tx.transaction>(rtx.transaction)
-  expectDeprecated(rtx.transaction)
+  expectNotDeprecated(rtx.transaction)
 
   expectType<NotAllowed>(rtx.updateTable)
   expectDeprecated(rtx.updateTable)
@@ -564,10 +564,10 @@ async function testReadonlyControlledTransaction(
   expectNotDeprecated(rtx.selectNoFrom)
 
   expectType<typeof tx.startTransaction>(rtx.startTransaction)
-  expectDeprecated(rtx.startTransaction)
+  expectNotDeprecated(rtx.startTransaction)
 
   expectType<typeof tx.transaction>(rtx.transaction)
-  expectDeprecated(rtx.transaction)
+  expectNotDeprecated(rtx.transaction)
 
   expectType<NotAllowed>(rtx.updateTable)
   expectDeprecated(rtx.updateTable)

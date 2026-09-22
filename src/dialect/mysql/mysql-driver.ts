@@ -3,7 +3,11 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver, TransactionSettings } from '../../driver/driver.js'
+import type {
+  Driver,
+  TransactionCapabilities,
+  TransactionSettings,
+} from '../../driver/driver.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
@@ -28,6 +32,19 @@ export class MysqlDriver implements Driver {
 
   constructor(config: MysqlDialectConfig) {
     this.#config = freeze({ ...config })
+  }
+
+  get supportsTransactionSettings(): TransactionCapabilities {
+    return {
+      // MySQL doesn't support snapshot isolation.
+      isolationLevels: [
+        'read uncommitted',
+        'read committed',
+        'repeatable read',
+        'serializable',
+      ],
+      accessModes: ['read only', 'read write'],
+    }
   }
 
   async init(options?: AbortableOperationOptions): Promise<void> {

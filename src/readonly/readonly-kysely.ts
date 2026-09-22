@@ -219,6 +219,8 @@ export interface ReadonlyTransaction<DB>
       Transaction<DB>,
       | 'connection'
       | 'destroy'
+      | 'isCommitted'
+      | 'isRolledBack'
       | 'isTransaction'
       | 'startTransaction'
       | 'transaction'

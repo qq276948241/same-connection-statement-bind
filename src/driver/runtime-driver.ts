@@ -1,4 +1,5 @@
 import type { DialectAdapter } from '../dialect/dialect-adapter.js'
+import type { TransactionCapabilities } from './driver.js'
 import type { CompiledQuery } from '../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../query-compiler/query-compiler.js'
 import type { Log } from '../util/log.js'
@@ -119,6 +120,10 @@ export class RuntimeDriver implements Driver {
     settings: TransactionSettings,
   ): Promise<void> {
     return await this.#driver.beginTransaction(connection, settings)
+  }
+
+  get supportsTransactionSettings(): TransactionCapabilities | undefined {
+    return this.#driver.supportsTransactionSettings
   }
 
   async commitTransaction(connection: DatabaseConnection): Promise<void> {
