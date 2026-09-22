@@ -2,9 +2,13 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver } from '../../driver/driver.js'
+import type {
+  Driver,
+  TransactionCapabilities,
+  TransactionSettings,
+} from '../../driver/driver.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
-import type { CompiledQuery } from '../../query-compiler/compiled-query.js'
+import { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
 import {
   waitOrAbort,
@@ -37,8 +41,33 @@ export class PGliteDriver implements Driver {
     return this.#connection!
   }
 
-  async beginTransaction(connection: PGliteConnection): Promise<void> {
+  async beginTransaction(
+    connection: PGliteConnection,
+    settings: TransactionSettings,
+  ): Promise<void> {
     await connection[PRIVATE_BEGIN_TRANSACTION_METHOD]()
+
+    // Apply the settings inside the transaction instead of ignoring them, so
+    // an unsupported/downgraded setting can never silently succeed.
+    if (settings.isolationLevel || settings.accessMode) {
+      const parts: string[] = []
+
+      if (settings.isolationLevel) {
+        parts.push(`isolation level ${settings.isolationLevel}`)
+      }
+
+      if (settings.accessMode) {
+        parts.push(settings.accessMode)
+      }
+
+      await connection.executeQuery(
+        CompiledQuery.raw(`set transaction ${parts.join(', ')}`),
+      )
+    }
+  }
+
+  getTransactionCapabilities(): TransactionCapabilities {
+    return PGLITE_TRANSACTION_CAPABILITIES
   }
 
   async commitTransaction(connection: PGliteConnection): Promise<void> {
@@ -194,3 +223,13 @@ class PGliteConnection implements DatabaseConnection {
     this.#transactionClosedPromise = undefined
   }
 }
+
+const PGLITE_TRANSACTION_CAPABILITIES: TransactionCapabilities = freeze({
+  supportedIsolationLevels: [
+    'read committed',
+    'repeatable read',
+    'serializable',
+  ],
+  supportedAccessModes: ['read only', 'read write'],
+  supportsSavepoints: true,
+})

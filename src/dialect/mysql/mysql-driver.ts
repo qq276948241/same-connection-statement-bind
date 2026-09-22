@@ -3,7 +3,11 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver, TransactionSettings } from '../../driver/driver.js'
+import type {
+  Driver,
+  TransactionCapabilities,
+  TransactionSettings,
+} from '../../driver/driver.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
@@ -95,6 +99,10 @@ export class MysqlDriver implements Driver {
 
   async rollbackTransaction(connection: DatabaseConnection): Promise<void> {
     await connection.executeQuery(CompiledQuery.raw('rollback'))
+  }
+
+  getTransactionCapabilities(): TransactionCapabilities {
+    return MYSQL_TRANSACTION_CAPABILITIES
   }
 
   async savepoint(
@@ -376,3 +384,14 @@ class MysqlConnection implements DatabaseConnection {
     }
   }
 }
+
+const MYSQL_TRANSACTION_CAPABILITIES: TransactionCapabilities = freeze({
+  supportedIsolationLevels: [
+    'read uncommitted',
+    'read committed',
+    'repeatable read',
+    'serializable',
+  ],
+  supportedAccessModes: ['read only', 'read write'],
+  supportsSavepoints: true,
+})

@@ -11,9 +11,12 @@ import { freeze, isObject, isUndefined } from './util/object-utils.js'
 import { RuntimeDriver } from './driver/runtime-driver.js'
 import { SingleConnectionProvider } from './driver/single-connection-provider.js'
 import {
+  DEFAULT_TRANSACTION_CAPABILITIES,
   type Driver,
   type IsolationLevel,
   type AccessMode,
+  assertTransactionSettingsSupported,
+  type TransactionSettings,
   validateTransactionSettings,
 } from './driver/driver.js'
 import {
@@ -50,6 +53,15 @@ import type {
   AbortableOperationOptions,
   AbortableQueryOptions,
 } from './util/abort.js'
+import {
+  assertTransactionOpen,
+  createTransactionState,
+  isMutatingQuery,
+  NoActiveTransactionError,
+  ReadOnlyTransactionError,
+  SavepointNameGenerator,
+  type TransactionState,
+} from './util/transaction-utils.js'
 
 declare global {
   interface AsyncDisposable {}
@@ -643,9 +655,9 @@ export class Kysely<DB>
 }
 
 export class Transaction<DB> extends Kysely<DB> {
-  readonly #props: KyselyProps
+  readonly #props: TransactionProps
 
-  constructor(props: KyselyProps) {
+  constructor(props: TransactionProps) {
     super(props)
     this.#props = props
   }
@@ -658,12 +670,28 @@ export class Transaction<DB> extends Kysely<DB> {
   }
 
   /**
-   * @deprecated calling the transaction method for a Transaction is not supported
+   * Opens a nested transaction inside this transaction.
+   *
+   * A nested transaction is implemented using a savepoint on the same
+   * connection as the outer transaction. If the callback throws, only the
+   * savepoint is rolled back and the outer transaction keeps going. If the
+   * callback succeeds the savepoint is released; rolling back the outer
+   * transaction later still undoes everything the inner transaction did.
+   *
+   * Isolation level and access mode belong to the outermost transaction and
+   * cannot be changed for a nested transaction.
    */
-  override transaction(): never {
-    throw new Error(
-      'calling the transaction method for a Transaction is not supported',
-    )
+  override transaction(): TransactionBuilder<DB> {
+    if (!this.#props.transactionContext) {
+      throw new Error(
+        'A nested transaction can only be created inside an active transaction',
+      )
+    }
+
+    return new TransactionBuilder({
+      ...this.#props,
+      transactionContext: this.#props.transactionContext,
+    })
   }
 
   /**
@@ -769,6 +797,25 @@ export interface KyselyProps {
   readonly driver: Driver
   readonly executor: QueryExecutor
   readonly dialect: Dialect
+}
+
+interface TransactionProps extends KyselyProps {
+  transactionContext?: TransactionContext
+}
+
+/**
+ * The mutable state shared by a whole transaction tree (outer transaction
+ * and its savepoint-based nested transactions). All of them run on a single
+ * connection and share the commit/rollback state.
+ */
+interface TransactionContext {
+  readonly driver: Driver
+  readonly state: TransactionState
+  readonly savepointNames: SavepointNameGenerator
+  readonly readOnly?: boolean
+  connection: DatabaseConnection
+  afterRollback?: () => void
+  depth: number
 }
 
 export function isKyselyProps(obj: unknown): obj is KyselyProps {
@@ -881,22 +928,61 @@ export class TransactionBuilder<DB> {
   }
 
   async execute<T>(callback: (trx: Transaction<DB>) => Promise<T>): Promise<T> {
-    const { isolationLevel, accessMode, ...kyselyProps } = this.#props
+    const {
+      isolationLevel,
+      accessMode,
+      transactionContext: existingContext,
+      ...kyselyProps
+    } = this.#props
     const settings = { isolationLevel, accessMode }
 
     validateTransactionSettings(settings)
 
-    return this.#props.executor.provideConnection(async (connection) => {
-      const state = { isCommitted: false, isRolledBack: false }
+    if (existingContext) {
+      return await this.#executeSavepoint(existingContext, settings, callback)
+    }
 
-      const executor = new NotCommittedOrRolledBackAssertingExecutor(
+    return await this.#executeTransaction(settings, callback)
+  }
+
+  async #executeTransaction<T>(
+    settings: TransactionSettings,
+    callback: (trx: Transaction<DB>) => Promise<T>,
+  ): Promise<T> {
+    // Reject isolation levels/access modes this dialect can't honor before
+    // acquiring a connection or beginning anything. The transaction must
+    // never silently run at a weaker level and still report success.
+    assertTransactionSettingsSupported(
+      settings,
+      this.#props.driver.getTransactionCapabilities?.() ??
+        DEFAULT_TRANSACTION_CAPABILITIES,
+    )
+
+    return await this.#props.executor.provideConnection(async (connection) => {
+      const state = createTransactionState()
+
+      const context: TransactionContext = {
+        driver: this.#props.driver,
+        state,
+        savepointNames: new SavepointNameGenerator(),
+        readOnly: settings.accessMode === 'read only',
+        connection,
+        depth: 0,
+      }
+
+      const executor = new TransactionBoundaryExecutor(
         this.#props.executor.withConnectionProvider(
           new SingleConnectionProvider(connection),
         ),
-        state,
+        context,
+        connection,
       )
 
-      const transaction = new Transaction<DB>({ ...kyselyProps, executor })
+      const transaction = new Transaction<DB>({
+        ...this.#props,
+        executor,
+        transactionContext: context,
+      })
 
       let transactionBegun = false
       try {
@@ -910,18 +996,90 @@ export class TransactionBuilder<DB> {
 
         return result
       } catch (error) {
-        if (transactionBegun) {
-          await this.#props.driver.rollbackTransaction(connection)
-          state.isRolledBack = true
+        if (transactionBegun && !state.isRolledBack) {
+          try {
+            await this.#props.driver.rollbackTransaction(connection)
+            state.isRolledBack = true
+          } catch (rollbackError) {
+            // A failed rollback must not be hidden behind a fake commit.
+            throw new TransactionRollbackError(rollbackError, error)
+          }
         }
 
         throw error
       }
     })
   }
+
+  async #executeSavepoint<T>(
+    context: TransactionContext,
+    settings: TransactionSettings,
+    callback: (trx: Transaction<DB>) => Promise<T>,
+  ): Promise<T> {
+    assertTransactionOpen(context.state)
+
+    if (settings.isolationLevel || settings.accessMode) {
+      throw new Error(
+        'Isolation level and access mode can only be set for the outermost transaction. ' +
+          'Nested transactions use savepoints and inherit the outer transaction settings.',
+      )
+    }
+
+    const capabilities =
+      context.driver.getTransactionCapabilities?.() ??
+      DEFAULT_TRANSACTION_CAPABILITIES
+
+    if (!capabilities.supportsSavepoints) {
+      throw new Error(
+        'Nested transactions require savepoint support, which this dialect does not provide.',
+      )
+    }
+
+    context.depth++
+    const savepointName = context.savepointNames.next(context.depth)
+
+    const connection = context.connection
+    let savepointEstablished = false
+    try {
+      await context.driver.savepoint!(
+        connection,
+        savepointName,
+        this.#props.executor.compileQuery.bind(this.#props.executor),
+      )
+      savepointEstablished = true
+
+      const result = await callback(
+        new Transaction<DB>({ ...this.#props, transactionContext: context }),
+      )
+
+      await context.driver.releaseSavepoint!(
+        connection,
+        savepointName,
+        this.#props.executor.compileQuery.bind(this.#props.executor),
+      )
+
+      return result
+    } catch (error) {
+      if (savepointEstablished && !context.state.isRolledBack) {
+        try {
+          await context.driver.rollbackToSavepoint!(
+            connection,
+            savepointName,
+            this.#props.executor.compileQuery.bind(this.#props.executor),
+          )
+        } catch (rollbackError) {
+          throw new TransactionRollbackError(rollbackError, error)
+        }
+      }
+
+      throw error
+    } finally {
+      context.depth--
+    }
+  }
 }
 
-interface TransactionBuilderProps extends KyselyProps {
+interface TransactionBuilderProps extends TransactionProps {
   readonly accessMode?: AccessMode
   readonly isolationLevel?: IsolationLevel
 }
@@ -955,15 +1113,41 @@ export class ControlledTransactionBuilder<DB> {
 
     validateTransactionSettings(settings)
 
+    assertTransactionSettingsSupported(
+      settings,
+      this.#props.driver.getTransactionCapabilities?.() ??
+        DEFAULT_TRANSACTION_CAPABILITIES,
+    )
+
     const connection = await provideControlledConnection(this.#props.executor)
 
-    await this.#props.driver.beginTransaction(connection.connection, settings)
+    try {
+      await this.#props.driver.beginTransaction(connection.connection, settings)
+    } catch (error) {
+      connection.release()
+      throw error
+    }
+
+    const context: TransactionContext = {
+      driver: this.#props.driver,
+      state: createTransactionState(),
+      savepointNames: new SavepointNameGenerator(),
+      readOnly: settings.accessMode === 'read only',
+      connection: connection.connection,
+      afterRollback: connection.release,
+      depth: 0,
+    }
 
     return new ControlledTransaction({
       ...props,
       connection,
-      executor: this.#props.executor.withConnectionProvider(
-        new SingleConnectionProvider(connection.connection),
+      transactionContext: context,
+      executor: new TransactionBoundaryExecutor(
+        this.#props.executor.withConnectionProvider(
+          new SingleConnectionProvider(connection.connection),
+        ),
+        context,
+        connection.connection,
       ),
     })
   }
@@ -975,25 +1159,18 @@ export class ControlledTransaction<
 > extends Transaction<DB> {
   readonly #props: ControlledTransactionProps
   readonly #compileQuery: QueryCompiler['compileQuery']
-  readonly #state: ControlledTransctionState
+  readonly #state: TransactionState
 
   constructor(props: ControlledTransactionProps) {
-    const state = { isCommitted: false, isRolledBack: false }
-    props = {
-      ...props,
-      executor: new NotCommittedOrRolledBackAssertingExecutor(
-        props.executor,
-        state,
-      ),
-    }
     const { connection, ...transactionProps } = props
     super(transactionProps)
 
     this.#props = freeze(props)
-    this.#state = state
+    this.#state = props.transactionContext!.state
 
     const queryId = createQueryId()
-    this.#compileQuery = (node) => props.executor.compileQuery(node, queryId)
+    this.#compileQuery = (node) =>
+      this.#props.executor.compileQuery(node, queryId)
   }
 
   get isCommitted(): boolean {
@@ -1029,14 +1206,24 @@ export class ControlledTransaction<
    * ```
    */
   commit(): Command<void> {
-    assertNotCommittedOrRolledBack(this.#state)
+    assertTransactionOpen(this.#state)
 
     return new Command(async (): Promise<void> => {
-      await this.#props.driver.commitTransaction(
-        this.#props.connection.connection,
-      )
-      this.#state.isCommitted = true
-      this.#props.connection.release()
+      try {
+        await this.#props.driver.commitTransaction(
+          this.#props.connection.connection,
+        )
+        this.#state.isCommitted = true
+      } catch (error) {
+        // A failed commit must never look like a success. If the connection
+        // is gone the server-side outcome is unknown; mark the transaction
+        // closed as rolled back rather than leaving statements dangling on a
+        // reconnected auto-commit connection.
+        this.#state.isRolledBack = true
+        throw error
+      } finally {
+        this.#props.connection.release()
+      }
     })
   }
 
@@ -1065,14 +1252,22 @@ export class ControlledTransaction<
    * ```
    */
   rollback(): Command<void> {
-    assertNotCommittedOrRolledBack(this.#state)
+    if (this.#state.isCommitted || this.#state.isRolledBack) {
+      throw new NoActiveTransactionError()
+    }
 
     return new Command(async (): Promise<void> => {
-      await this.#props.driver.rollbackTransaction(
-        this.#props.connection.connection,
-      )
-      this.#state.isRolledBack = true
-      this.#props.connection.release()
+      try {
+        await this.#props.driver.rollbackTransaction(
+          this.#props.connection.connection,
+        )
+        this.#state.isRolledBack = true
+      } catch (error) {
+        // Surface the rollback failure; do not silently mark success.
+        throw error
+      } finally {
+        this.#props.connection.release()
+      }
     })
   }
 
@@ -1108,7 +1303,7 @@ export class ControlledTransaction<
   savepoint<SN extends string>(
     savepointName: SN extends S ? never : SN,
   ): Command<ControlledTransaction<DB, [...S, SN]>> {
-    assertNotCommittedOrRolledBack(this.#state)
+    assertTransactionOpen(this.#state)
 
     return new Command(
       async (): Promise<ControlledTransaction<DB, [...S, SN]>> => {
@@ -1158,7 +1353,7 @@ export class ControlledTransaction<
   ): RollbackToSavepoint<S, SN> extends string[]
     ? Command<ControlledTransaction<DB, RollbackToSavepoint<S, SN>>>
     : never {
-    assertNotCommittedOrRolledBack(this.#state)
+    assertTransactionOpen(this.#state)
 
     return new Command(
       async (): Promise<
@@ -1215,7 +1410,7 @@ export class ControlledTransaction<
   ): ReleaseSavepoint<S, SN> extends string[]
     ? Command<ControlledTransaction<DB, ReleaseSavepoint<S, SN>>>
     : never {
-    assertNotCommittedOrRolledBack(this.#state)
+    assertTransactionOpen(this.#state)
 
     return new Command(
       async (): Promise<ControlledTransaction<DB, ReleaseSavepoint<S, SN>>> => {
@@ -1280,12 +1475,7 @@ export class ControlledTransaction<
   }
 }
 
-interface ControlledTransctionState {
-  isCommitted: boolean
-  isRolledBack: boolean
-}
-
-interface ControlledTransactionProps extends KyselyProps {
+interface ControlledTransactionProps extends TransactionProps {
   readonly connection: ControlledConnection
 }
 
@@ -1304,34 +1494,64 @@ export class Command<T> {
   }
 }
 
-function assertNotCommittedOrRolledBack(
-  state: ControlledTransctionState,
-): void {
-  if (state.isCommitted) {
-    throw new Error('Transaction is already committed')
-  }
+/**
+ * Carries the underlying cause when a rollback attempted after a failed
+ * statement itself fails. Both errors are surfaced instead of pretending the
+ * transaction was committed.
+ */
+export class TransactionRollbackError extends Error {
+  readonly rollbackError: unknown
+  readonly originalError: unknown
 
-  if (state.isRolledBack) {
-    throw new Error('Transaction is already rolled back')
+  constructor(rollbackError: unknown, originalError: unknown) {
+    const rollbackReason =
+      rollbackError instanceof Error
+        ? rollbackError.message
+        : String(rollbackError)
+
+    super(
+      `Transaction rollback failed after an error: ${rollbackReason}. ` +
+        'The transaction was not committed.',
+    )
+    this.name = 'TransactionRollbackError'
+    this.rollbackError = rollbackError
+    this.originalError = originalError
+
+    if (rollbackError instanceof Error) {
+      this.stack = rollbackError.stack
+    }
   }
 }
 
 /**
- * An executor wrapper that asserts that the transaction state is not committed
- * or rolled back when a query is executed.
+ * An executor wrapper bound to one transaction (and therefore one
+ * connection). It makes sure:
  *
- * @internal
+ * - no query runs after the transaction has been committed or rolled back,
+ * - writes inside a read-only transaction are rejected and roll the whole
+ *   transaction back,
+ * - a statement that fails because the connection died ends the transaction
+ *   instead of leaving the caller believing it is still open.
  */
-class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
+class TransactionBoundaryExecutor implements QueryExecutor {
   readonly #executor: QueryExecutor
-  readonly #state: ControlledTransctionState
+  readonly #context: TransactionContext
+  readonly #connection: DatabaseConnection
 
-  constructor(executor: QueryExecutor, state: ControlledTransctionState) {
-    this.#executor =
-      executor instanceof NotCommittedOrRolledBackAssertingExecutor
-        ? executor.#executor
-        : executor
-    this.#state = state
+  constructor(
+    executor: QueryExecutor,
+    context: TransactionContext,
+    connection: DatabaseConnection,
+  ) {
+    this.#executor = TransactionBoundaryExecutor.unwrap(executor)
+    this.#context = context
+    this.#connection = connection
+  }
+
+  private static unwrap(executor: QueryExecutor): QueryExecutor {
+    return executor instanceof TransactionBoundaryExecutor
+      ? TransactionBoundaryExecutor.unwrap(executor.#executor)
+      : executor
   }
 
   get adapter() {
@@ -1364,8 +1584,13 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
     compiledQuery: CompiledQuery<R>,
     options?: AbortableQueryOptions,
   ): Promise<QueryResult<R>> {
-    assertNotCommittedOrRolledBack(this.#state)
-    return this.#executor.executeQuery(compiledQuery, options)
+    assertTransactionOpen(this.#context.state)
+
+    if (this.#context.readOnly && isMutatingQuery(compiledQuery)) {
+      return this.#rejectWriteInReadOnlyTransaction()
+    }
+
+    return this.#guard(this.#executor.executeQuery(compiledQuery, options))
   }
 
   stream<R>(
@@ -1373,44 +1598,142 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
     chunkSize: number,
     options?: AbortableOperationOptions,
   ): AsyncIterableIterator<QueryResult<R>> {
-    assertNotCommittedOrRolledBack(this.#state)
-    return this.#executor.stream(compiledQuery, chunkSize, options)
+    assertTransactionOpen(this.#context.state)
+
+    if (this.#context.readOnly && isMutatingQuery(compiledQuery)) {
+      throw new ReadOnlyTransactionError()
+    }
+
+    return this.#guardStream(
+      this.#executor.stream(compiledQuery, chunkSize, options),
+    )
+  }
+
+  async #rejectWriteInReadOnlyTransaction(): Promise<never> {
+    const error = new ReadOnlyTransactionError()
+
+    // A write in a read-only transaction aborts the whole transaction.
+    await this.#rollbackAfterFailure(error)
+
+    throw error
+  }
+
+  async #rollbackAfterFailure(error: unknown): Promise<void> {
+    if (this.#context.state.isRolledBack) {
+      return
+    }
+
+    try {
+      await this.#context.driver.rollbackTransaction(this.#connection)
+      this.#context.state.isRolledBack = true
+      this.#context.afterRollback?.()
+    } catch (rollbackError) {
+      throw new TransactionRollbackError(rollbackError, error)
+    }
+  }
+
+  async #guard<T>(promise: Promise<T>): Promise<T> {
+    try {
+      return await promise
+    } catch (error) {
+      // If the connection is gone mid-transaction the transaction ends here.
+      // Mark it rolled back so pending statements can never be reported as
+      // committed against a reconnected, auto-commit connection.
+      if (isConnectionLostError(error) && !this.#context.state.isCommitted) {
+        this.#markDisconnected()
+      }
+
+      throw error
+    }
+  }
+
+  async *#guardStream<R>(
+    iterator: AsyncIterableIterator<QueryResult<R>>,
+  ): AsyncIterableIterator<QueryResult<R>> {
+    try {
+      yield* iterator
+    } catch (error) {
+      if (isConnectionLostError(error) && !this.#context.state.isCommitted) {
+        this.#markDisconnected()
+      }
+
+      throw error
+    }
+  }
+
+  #markDisconnected(): void {
+    this.#context.state.isRolledBack = true
+    this.#context.afterRollback?.()
   }
 
   withConnectionProvider(
     connectionProvider: ConnectionProvider,
   ): QueryExecutor {
-    return new NotCommittedOrRolledBackAssertingExecutor(
+    return new TransactionBoundaryExecutor(
       this.#executor.withConnectionProvider(connectionProvider),
-      this.#state,
+      this.#context,
+      this.#connection,
     )
   }
 
   withPlugin(plugin: KyselyPlugin): QueryExecutor {
-    return new NotCommittedOrRolledBackAssertingExecutor(
+    return new TransactionBoundaryExecutor(
       this.#executor.withPlugin(plugin),
-      this.#state,
+      this.#context,
+      this.#connection,
     )
   }
 
   withPlugins(plugins: ReadonlyArray<KyselyPlugin>): QueryExecutor {
-    return new NotCommittedOrRolledBackAssertingExecutor(
+    return new TransactionBoundaryExecutor(
       this.#executor.withPlugins(plugins),
-      this.#state,
+      this.#context,
+      this.#connection,
     )
   }
 
   withPluginAtFront(plugin: KyselyPlugin): QueryExecutor {
-    return new NotCommittedOrRolledBackAssertingExecutor(
+    return new TransactionBoundaryExecutor(
       this.#executor.withPluginAtFront(plugin),
-      this.#state,
+      this.#context,
+      this.#connection,
     )
   }
 
   withoutPlugins(): QueryExecutor {
-    return new NotCommittedOrRolledBackAssertingExecutor(
+    return new TransactionBoundaryExecutor(
       this.#executor.withoutPlugins(),
-      this.#state,
+      this.#context,
+      this.#connection,
     )
   }
+}
+
+// Error signatures used by the supported drivers when a socket/connection
+// dies while a statement is in flight.
+const CONNECTION_LOST_PATTERNS: readonly RegExp[] = [
+  /connection terminated/i,
+  /connection lost/i,
+  /server closed the connection/i,
+  /the connection is closed/i,
+  /connection ended/i,
+  /socket hang up/i,
+  /epipe/i,
+  /etimedout/i,
+  /econnreset/i,
+  /can't set headers after they are sent/i,
+]
+
+function isConnectionLostError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false
+  }
+
+  const code = (error as { code?: string }).code
+
+  if (code === 'EPIPE' || code === 'ETIMEDOUT' || code === 'ECONNRESET') {
+    return true
+  }
+
+  return CONNECTION_LOST_PATTERNS.some((pattern) => pattern.test(error.message))
 }

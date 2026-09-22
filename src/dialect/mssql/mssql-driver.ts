@@ -5,6 +5,7 @@ import type {
 import type {
   Driver,
   IsolationLevel,
+  TransactionCapabilities,
   TransactionSettings,
 } from '../../driver/driver.js'
 import {
@@ -86,6 +87,10 @@ export class MssqlDriver implements Driver {
     await connection.rollbackTransaction()
   }
 
+  getTransactionCapabilities(): TransactionCapabilities {
+    return MSSQL_TRANSACTION_CAPABILITIES
+  }
+
   async savepoint(
     connection: MssqlConnection,
     savepointName: string,
@@ -112,6 +117,19 @@ export class MssqlDriver implements Driver {
     await this.#pool.destroy()
   }
 }
+
+const MSSQL_TRANSACTION_CAPABILITIES: TransactionCapabilities = freeze({
+  supportedIsolationLevels: [
+    'read uncommitted',
+    'read committed',
+    'repeatable read',
+    'serializable',
+    'snapshot',
+  ],
+  // SQL Server / tedious has no transaction access mode clause.
+  supportedAccessModes: [],
+  supportsSavepoints: true,
+})
 
 class MssqlConnection implements DatabaseConnection {
   readonly #connection: TediousConnection

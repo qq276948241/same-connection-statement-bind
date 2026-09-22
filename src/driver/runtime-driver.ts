@@ -10,7 +10,12 @@ import {
 import { performanceNow } from '../util/performance-now.js'
 import { ConnectionMutex } from './connection-mutex.js'
 import type { DatabaseConnection, QueryResult } from './database-connection.js'
-import type { Driver, TransactionSettings } from './driver.js'
+import {
+  DEFAULT_TRANSACTION_CAPABILITIES,
+  type Driver,
+  type TransactionCapabilities,
+  type TransactionSettings,
+} from './driver.js'
 
 /**
  * A small wrapper around {@link Driver} that makes sure the driver is
@@ -119,6 +124,13 @@ export class RuntimeDriver implements Driver {
     settings: TransactionSettings,
   ): Promise<void> {
     return await this.#driver.beginTransaction(connection, settings)
+  }
+
+  getTransactionCapabilities(): TransactionCapabilities {
+    return (
+      this.#driver.getTransactionCapabilities?.() ??
+      DEFAULT_TRANSACTION_CAPABILITIES
+    )
   }
 
   async commitTransaction(connection: DatabaseConnection): Promise<void> {

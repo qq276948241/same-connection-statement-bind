@@ -2,7 +2,11 @@ import type {
   DatabaseConnection,
   QueryResult,
 } from '../../driver/database-connection.js'
-import type { Driver } from '../../driver/driver.js'
+import {
+  type Driver,
+  type TransactionCapabilities,
+  type TransactionSettings,
+} from '../../driver/driver.js'
 import { SelectQueryNode } from '../../operation-node/select-query-node.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import { CompiledQuery } from '../../query-compiler/compiled-query.js'
@@ -41,8 +45,19 @@ export class SqliteDriver implements Driver {
     return this.#connection!
   }
 
-  async beginTransaction(connection: DatabaseConnection): Promise<void> {
+  // SQLite doesn't support isolation levels (a database is always effectively
+  // at "serializable") and it doesn't understand access mode clauses in
+  // `begin`. Read-only transactions are enforced by Kysely itself, so here we
+  // only issue a plain `begin`.
+  async beginTransaction(
+    connection: DatabaseConnection,
+    _settings: TransactionSettings,
+  ): Promise<void> {
     await connection.executeQuery(CompiledQuery.raw('begin'))
+  }
+
+  getTransactionCapabilities(): TransactionCapabilities {
+    return SQLITE_TRANSACTION_CAPABILITIES
   }
 
   async commitTransaction(connection: DatabaseConnection): Promise<void> {
@@ -148,3 +163,13 @@ class SqliteConnection implements DatabaseConnection {
     }
   }
 }
+
+const SQLITE_TRANSACTION_CAPABILITIES: TransactionCapabilities = freeze({
+  // SQLite always uses a single, serialized isolation level and provides no
+  // way to select one of the ANSI levels. Asking for one must be rejected at
+  // the start instead of being silently ignored.
+  supportedIsolationLevels: [],
+  // Access modes are enforced by Kysely for SQLite.
+  supportedAccessModes: ['read only', 'read write'],
+  supportsSavepoints: true,
+})
